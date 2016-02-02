@@ -25,9 +25,12 @@ class SaasServer(http.Controller):
         _logger.info('new_database post: %s', post)
 
         state = simplejson.loads(post.get('state'))
+        owner_user = state.get('owner_user')
         new_db = state.get('d')
+        trial = state.get('t')
         expiration_db = state.get('e')
         template_db = state.get('db_template')
+        disable_mail_server = state.get('disable_mail_server', False)
         demo = state.get('demo')
         lang = state.get('lang', 'en_US')
         tz = state.get('tz')
@@ -36,25 +39,24 @@ class SaasServer(http.Controller):
         action = 'base.open_module_tree'
         access_token = post['access_token']
 
-        if is_template_db:
-            # TODO: check access right to crete template db
-            client_id = post['client_id']
-            saas_portal_user = None
-        else:
-            saas_oauth_provider = request.registry['ir.model.data'].xmlid_to_object(request.cr, SUPERUSER_ID, 'saas_server.saas_oauth_provider')
-            saas_portal_user = request.registry['res.users']._auth_oauth_rpc(request.cr, SUPERUSER_ID, saas_oauth_provider.validation_endpoint, access_token)
-            client_id = saas_portal_user.get('client_id')
-            if saas_portal_user.get("error"):
-                raise Exception(saas_portal_user['error'])
+        client_id = post['client_id']
+        saas_oauth_provider = request.registry['ir.model.data'].xmlid_to_object(request.cr, SUPERUSER_ID, 'saas_server.saas_oauth_provider')
+        saas_portal_user = request.registry['res.users']._auth_oauth_rpc(request.cr, SUPERUSER_ID, saas_oauth_provider.validation_endpoint, access_token)
+        if saas_portal_user.get('user_id') != 1:
+            raise Exception('auth error')
+        if saas_portal_user.get("error"):
+            raise Exception(saas_portal_user['error'])
 
-        client_data = {'name':new_db, 'client_id': client_id, 'expiration_datetime': expiration_db}
+        client_data = {'name': new_db, 'client_id': client_id, 'expiration_datetime': expiration_db, 'trial': trial}
         client = request.env['saas_server.client'].sudo().create(client_data)
         client.create_database(template_db, demo, lang)
         client.install_addons(addons=addons, is_template_db=is_template_db)
+        if disable_mail_server:
+            client.disable_mail_servers()
         client.update_registry()
         client.prepare_database(
             tz=tz,
-            saas_portal_user = saas_portal_user,
+            owner_user = owner_user,
             is_template_db = is_template_db,
             access_token = access_token)
 
@@ -71,18 +73,17 @@ class SaasServer(http.Controller):
             oauth_provider_id = client_env.ref('saas_server.saas_oauth_provider').id
             action_id = client_env.ref(action).id
 
-        params = {
-            'access_token': post['access_token'],
+        port = self._get_port()
+        scheme = request.httprequest.scheme
+        url = '{scheme}://{domain}:{port}/saas_client/new_database'.format(scheme=scheme, domain=new_db, port=port)
+        return simplejson.dumps({
+            'url': url,
             'state': simplejson.dumps({
                 'd': new_db,
                 'p': oauth_provider_id,
                 'a': action_id
                 }),
-            'action': action
-            }
-        scheme = request.httprequest.scheme
-        port = self._get_port()
-        return werkzeug.utils.redirect('{scheme}://{domain}:{port}/saas_client/new_database?{params}'.format(scheme=scheme, domain=new_db, port=port, params=werkzeug.url_encode(params)))
+        })
 
     @http.route('/saas_server/edit_database', type='http', auth='public', website=True)
     @fragment_to_query_string
@@ -111,6 +112,8 @@ class SaasServer(http.Controller):
         saas_oauth_provider = request.registry['ir.model.data'].xmlid_to_object(request.cr, SUPERUSER_ID, 'saas_server.saas_oauth_provider')
 
         saas_portal_user = request.registry['res.users']._auth_oauth_rpc(request.cr, SUPERUSER_ID, saas_oauth_provider.validation_endpoint, access_token)
+        if saas_portal_user.get('user_id') != 1:
+            raise Exception('auth error')
         if saas_portal_user.get("error"):
             raise Exception(saas_portal_user['error'])
 
@@ -118,6 +121,26 @@ class SaasServer(http.Controller):
         client = request.env['saas_server.client'].sudo().search([('client_id', '=', client_id)])
         result = client.upgrade_database(data=state.get('data'))[0]
         return simplejson.dumps({client.name: result})
+
+    @http.route('/saas_server/rename_database', type='http', website=True, auth='public')
+    @fragment_to_query_string
+    def rename_database(self, **post):
+        _logger.info('delete_database post: %s', post)
+        state = simplejson.loads(post.get('state'))
+        client_id = state.get('client_id')
+        db = state.get('d')
+        new_dbname = state.get('new_dbname')
+        saas_oauth_provider = request.registry['ir.model.data'].xmlid_to_object(request.cr, SUPERUSER_ID, 'saas_server.saas_oauth_provider')
+
+        access_token = post['access_token']
+        user_data = request.registry['res.users']._auth_oauth_rpc(request.cr, SUPERUSER_ID, saas_oauth_provider.validation_endpoint, access_token)
+        if user_data.get('user_id') != 1:
+            raise Exception('auth error')
+        if user_data.get("error"):
+            raise Exception(user_data['error'])
+
+        client = request.env['saas_server.client'].sudo().search([('client_id', '=', client_id)])
+        client.rename_database(new_dbname)
 
     @http.route('/saas_server/delete_database', type='http', website=True, auth='public')
     @fragment_to_query_string
@@ -131,6 +154,8 @@ class SaasServer(http.Controller):
         saas_oauth_provider = request.registry['ir.model.data'].xmlid_to_object(request.cr, SUPERUSER_ID, 'saas_server.saas_oauth_provider')
 
         user_data = request.registry['res.users']._auth_oauth_rpc(request.cr, SUPERUSER_ID, saas_oauth_provider.validation_endpoint, access_token)
+        if user_data.get('user_id') != 1:
+            raise Exception('auth error')
         if user_data.get("error"):
             raise Exception(user_data['error'])
 
@@ -236,8 +261,11 @@ class SaasServer(http.Controller):
                 'state': client.state,
                 'client_id': client.client_id,
                 'users_len': client.users_len,
+                'max_users': client.max_users,
+                'state': client.state,
                 'file_storage': client.file_storage,
                 'db_storage': client.db_storage,
+                'total_storage_limit': client.total_storage_limit,
             })
         return simplejson.dumps(res)
     

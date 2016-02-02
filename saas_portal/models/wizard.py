@@ -22,9 +22,12 @@ class SaasConfig(models.TransientModel):
                                 'Action')
     database_id = fields.Many2one('saas_portal.client', string='Database', default=_default_database_id)
     server_id = fields.Many2one('saas_portal.server', string='Server', related='database_id.server_id', readonly=True)
+    update_addons_list = fields.Boolean('Update Addon List', default=True)
     update_addons = fields.Char('Update Addons', size=256)
     install_addons = fields.Char('Install Addons', size=256)
     uninstall_addons = fields.Char('Uninstall Addons', size=256)
+    access_owner_add = fields.Char('Grant access to Owner')
+    access_remove = fields.Char('Restrict access', help='Restrict access for all users except super-user.\nNote, that ')
     fix_ids = fields.One2many('saas.config.fix', 'config_id', 'Fixes')
     param_ids = fields.One2many('saas.config.param', 'config_id', 'Parameters')
     description = fields.Text('Result')
@@ -43,31 +46,21 @@ class SaasConfig(models.TransientModel):
 
     @api.multi
     def upgrade_database(self):
+        self.ensure_one()
         obj = self[0]
         scheme = request.httprequest.scheme
         payload = {
-            'update_addons': (obj.update_addons or '').split(','),
-            'install_addons': (obj.install_addons or '').split(','),
-            'uninstall_addons': (obj.uninstall_addons or '').split(','),
+            'update_addons_list': (obj.update_addons_list or ''),
+            'update_addons': obj.update_addons.split(',') if obj.update_addons else [],
+            'install_addons': obj.install_addons.split(',') if obj.install_addons else [],
+            'uninstall_addons': obj.uninstall_addons.split(',') if obj.uninstall_addons else [],
+            'access_owner_add': obj.access_owner_add.split(',') if obj.access_owner_add else [],
+            'access_remove': obj.access_remove.split(',') if obj.access_remove else [],
             'fixes': [[x.model, x.method] for x in obj.fix_ids],
-            'params': [[x.key, x.value] for x in obj.param_ids],
+            'params': [{'key': x.key, 'value': x.value, 'hidden': x.hidden} for x in obj.param_ids],
         }
-        state = {
-            'data': payload,
-        }
-        url = self.server_id._request_server(
-            path='/saas_server/upgrade_database',
-            client_id=self.database_id.client_id,
-            state=state,
-        )[0]
-        res = requests.get(url, verify=(self.server_id.request_scheme == 'https' and self.server_id.verify_ssl))
-        if res.ok != True:
-            msg = """Status Code - %s
-Reason - %s
-URL - %s
-            """ % (res.status_code, res.reason, res.url)
-            raise Warning(msg)
-        obj.write({'description': res.text})
+        res_text = self.do_upgrade_database(payload, self.database_id.id)
+        obj.write({'description': res_text})
         return {
             'type': 'ir.actions.act_window',
             'view_type': 'form',
@@ -77,6 +70,25 @@ URL - %s
             'target': 'new'
         }
 
+    @api.model
+    def do_upgrade_database(self, payload, saas_portal_client_id):
+        client = self.env['saas_portal.client'].browse(saas_portal_client_id)
+        state = {
+            'data': payload,
+        }
+        url = client.server_id._request_server(
+            path='/saas_server/upgrade_database',
+            client_id=client.client_id,
+            state=state,
+        )[0]
+        res = requests.get(url, verify=(self.server_id.request_scheme == 'https' and self.server_id.verify_ssl))
+        if res.ok != True:
+            msg = """Status Code - %s
+Reason - %s
+URL - %s
+            """ % (res.status_code, res.reason, res.url)
+            raise Warning(msg)
+        return res.text
 
 class SaasConfigFix(models.TransientModel):
     _name = 'saas.config.fix'
@@ -91,11 +103,14 @@ class SaasConfigParam(models.TransientModel):
     def _get_keys(self):
         return [
             ('saas_client.max_users', 'Max Users'),
+            ('saas_client.suspended', 'Suspended'),
+            ('saas_client.total_storage_limit', 'Total storage limit'),
         ]
 
     key = fields.Selection(selection=_get_keys, string='Key', required=1, size=64)
     value = fields.Char('Value', required=1, size=64)
     config_id = fields.Many2one('saas.config', 'Config')
+    hidden = fields.Boolean('Hidden parameter', default=True)
 
 class SaasPortalCreateClient(models.TransientModel):
     _name = 'saas_portal.create_client'
@@ -113,14 +128,88 @@ class SaasPortalCreateClient(models.TransientModel):
     name = fields.Char('Database name', required=True, default=_default_name)
     plan_id = fields.Many2one('saas_portal.plan', string='Plan', readonly=True, default=_default_plan_id)
     partner_id = fields.Many2one('res.partner', string='Partner')
+    user_id = fields.Many2one('res.users', string='User')
+    notify_user = fields.Boolean(help='Notify user by email when database will have been created', default=False)
+    support_team_id = fields.Many2one('saas_portal.support_team', 'Support Team', default=lambda self: self.env.user.support_team_id)
+
+    @api.onchange('user_id')
+    def update_parter(self):
+        if self.user_id:
+            self.partner_id = self.user_id.partner_id
 
     @api.multi
     def apply(self):
         wizard = self[0]
-        url = wizard.plan_id._create_new_database(dbname=wizard.name, partner_id=wizard.partner_id.id)
+        res = wizard.plan_id.create_new_database(dbname=wizard.name, partner_id=wizard.partner_id.id, user_id=self.user_id.id,
+                                                 notify_user=self.notify_user,
+                                                 support_team_id=self.support_team_id.id)
+        client = self.env['saas_portal.client'].browse(res.get('id'))
+        client.server_id.action_sync_server()
         return {
-            'type': 'ir.actions.act_url',
-            'target': 'new',
-            'name': 'Create Client',
-            'url': url
+            'type': 'ir.actions.act_window',
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'saas_portal.client',
+            'res_id': client.id,
+            'target': 'current',
+        }
+
+
+class SaasPortalDuplicateClient(models.TransientModel):
+    _name = 'saas_portal.duplicate_client'
+
+    def _default_client_id(self):
+        return self._context.get('active_id')
+
+    def _default_partner(self):
+        client_id = self._default_client_id()
+        if client_id:
+            client = self.env['saas_portal.client'].browse(client_id)
+            return client.partner_id
+        return ''
+    
+    def _default_expiration(self):
+        client_id = self._default_client_id()
+        if client_id:
+            client = self.env['saas_portal.client'].browse(client_id)
+            return client.plan_id.expiration
+        return ''
+
+    name = fields.Char('Database Name', required=True)
+    client_id = fields.Many2one('saas_portal.client', string='Base Client', readonly=True, default=_default_client_id)
+    expiration = fields.Integer('Expiration', default=_default_expiration)
+    partner_id = fields.Many2one('res.partner', string='Partner', default=_default_partner)
+
+    @api.multi
+    def apply(self):
+        self.ensure_one()
+        res = self.client_id.duplicate_database(
+            dbname=self.name, partner_id=self.partner_id.id, expiration=None)
+        client = self.env['saas_portal.client'].browse(res.get('id'))
+        client.server_id.action_sync_server()
+        return {
+            'type': 'ir.actions.act_window',
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'saas_portal.client',
+            'res_id': client.id,
+            'target': 'current',
+        }
+
+
+class SaasPortalRenameDatabase(models.TransientModel):
+    _name = 'saas_portal.rename_database'
+
+    def _default_client_id(self):
+        return self._context.get('active_id')
+
+    name = fields.Char('New Name', required=True)
+    client_id = fields.Many2one('saas_portal.client', string='Base Client', readonly=True, default=_default_client_id)
+
+    @api.multi
+    def apply(self):
+        self.ensure_one()
+        self.client_id.rename_database(new_dbname=self.name)
+        return {
+            'type': 'ir.actions.act_window_close',
         }
